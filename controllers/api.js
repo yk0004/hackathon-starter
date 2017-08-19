@@ -1,23 +1,18 @@
-'use strict';
-const _ = require('lodash');
-const async = require('async');
-const validator = require('validator');
-const request = require('request');
+const bluebird = require('bluebird');
+const request = bluebird.promisifyAll(require('request'), { multiArgs: true });
 const cheerio = require('cheerio');
 const graph = require('fbgraph');
 const LastFmNode = require('lastfm').LastFmNode;
 const tumblr = require('tumblr.js');
-const Github = require('github-api');
+const GitHub = require('github');
 const Twit = require('twit');
 const stripe = require('stripe')(process.env.STRIPE_SKEY);
 const twilio = require('twilio')(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 const Linkedin = require('node-linkedin')(process.env.LINKEDIN_ID, process.env.LINKEDIN_SECRET, process.env.LINKEDIN_CALLBACK_URL);
-const BitGo = require('bitgo');
 const clockwork = require('clockwork')({ key: process.env.CLOCKWORK_KEY });
 const paypal = require('paypal-rest-sdk');
 const lob = require('lob')(process.env.LOB_KEY);
-const ig = require('instagram-node').instagram();
-const Y = require('yui/yql');
+const ig = bluebird.promisifyAll(require('instagram-node').instagram());
 const foursquare = require('node-foursquare')({
   secrets: {
     clientId: process.env.FOURSQUARE_ID,
@@ -25,6 +20,9 @@ const foursquare = require('node-foursquare')({
     redirectUrl: process.env.FOURSQUARE_REDIRECT_URL
   }
 });
+
+foursquare.Venues = bluebird.promisifyAll(foursquare.Venues);
+foursquare.Users = bluebird.promisifyAll(foursquare.Users);
 
 /**
  * GET /api
@@ -42,32 +40,20 @@ exports.getApi = (req, res) => {
  */
 exports.getFoursquare = (req, res, next) => {
   const token = req.user.tokens.find(token => token.kind === 'foursquare');
-  async.parallel({
-    trendingVenues: (callback) => {
-      foursquare.Venues.getTrending('40.7222756', '-74.0022724', { limit: 50 }, token.accessToken, (err, results) => {
-        callback(err, results);
-      });
-    },
-    venueDetail: (callback) => {
-      foursquare.Venues.getVenue('49da74aef964a5208b5e1fe3', token.accessToken, (err, results) => {
-        callback(err, results);
-      });
-    },
-    userCheckins: (callback) => {
-      foursquare.Users.getCheckins('self', null, token.accessToken, (err, results) => {
-        callback(err, results);
-      });
-    }
-  },
-  (err, results) => {
-    if (err) { return next(err); }
+  Promise.all([
+    foursquare.Venues.getTrendingAsync('40.7222756', '-74.0022724', { limit: 50 }, token.accessToken),
+    foursquare.Venues.getVenueAsync('49da74aef964a5208b5e1fe3', token.accessToken),
+    foursquare.Users.getCheckinsAsync('self', null, token.accessToken)
+  ])
+  .then(([trendingVenues, venueDetail, userCheckins]) => {
     res.render('api/foursquare', {
       title: 'Foursquare API',
-      trendingVenues: results.trendingVenues,
-      venueDetail: results.venueDetail,
-      userCheckins: results.userCheckins
+      trendingVenues,
+      venueDetail,
+      userCheckins
     });
-  });
+  })
+  .catch(next);
 };
 
 /**
@@ -99,24 +85,11 @@ exports.getTumblr = (req, res, next) => {
 exports.getFacebook = (req, res, next) => {
   const token = req.user.tokens.find(token => token.kind === 'facebook');
   graph.setAccessToken(token.accessToken);
-  async.parallel({
-    getMyProfile: (done) => {
-      graph.get(`${req.user.facebook}?fields=id,name,email,first_name,last_name,gender,link,locale,timezone`, (err, me) => {
-        done(err, me);
-      });
-    },
-    getMyFriends: (done) => {
-      graph.get(`${req.user.facebook}/friends`, (err, friends) => {
-        done(err, friends.data);
-      });
-    }
-  },
-  (err, results) => {
+  graph.get(`${req.user.facebook}?fields=id,name,email,first_name,last_name,gender,link,locale,timezone`, (err, results) => {
     if (err) { return next(err); }
     res.render('api/facebook', {
       title: 'Facebook API',
-      me: results.getMyProfile,
-      friends: results.getMyFriends
+      profile: results
     });
   });
 };
@@ -125,8 +98,9 @@ exports.getFacebook = (req, res, next) => {
  * GET /api/scraping
  * Web scraping example using Cheerio library.
  */
-exports.getScraping = (req, res) => {
+exports.getScraping = (req, res, next) => {
   request.get('https://news.ycombinator.com/', (err, request, body) => {
+    if (err) { return next(err); }
     const $ = cheerio.load(body);
     const links = [];
     $('.title a[href^="http"], a[href^="https"]').each((index, element) => {
@@ -144,10 +118,8 @@ exports.getScraping = (req, res) => {
  * GitHub API Example.
  */
 exports.getGithub = (req, res, next) => {
-  const token = req.user.tokens.find(token => token.kind === 'github');
-  const github = new Github({ token: token.accessToken });
-  const repo = github.getRepo('sahat', 'satellizer');
-  repo.getDetails((err, repo) => {
+  const github = new GitHub();
+  github.repos.get({ owner: 'sahat', repo: 'hackathon-starter' }, (err, repo) => {
     if (err) { return next(err); }
     res.render('api/github', {
       title: 'GitHub API',
@@ -176,6 +148,7 @@ exports.getNewYorkTimes = (req, res, next) => {
     'api-key': process.env.NYT_KEY
   };
   request.get({ url: 'http://api.nytimes.com/svc/books/v2/lists', qs: query }, (err, request, body) => {
+    if (err) { return next(err); }
     if (request.statusCode === 403) {
       return next(new Error('Invalid New York Times API Key'));
     }
@@ -196,57 +169,67 @@ exports.getLastfm = (req, res, next) => {
     api_key: process.env.LASTFM_KEY,
     secret: process.env.LASTFM_SECRET
   });
-  async.parallel({
-    artistInfo: (done) => {
+  const artistInfo = () =>
+    new Promise((resolve, reject) => {
       lastfm.request('artist.getInfo', {
         artist: 'Roniit',
         handlers: {
-          success: (data) => done(null, data),
-          error: (err) => done(err)
+          success: resolve,
+          error: reject
         }
       });
-    },
-    artistTopTracks: (done) => {
+    });
+  const artistTopTracks = () =>
+    new Promise((resolve, reject) => {
       lastfm.request('artist.getTopTracks', {
         artist: 'Roniit',
         handlers: {
-          success: (data) => done(null, data.toptracks.track.slice(0, 10)),
-          error: (err) => done(err)
+          success: (data) => {
+            resolve(data.toptracks.track.slice(0, 10));
+          },
+          error: reject
         }
       });
-    },
-    artistTopAlbums: (done) => {
-      lastfm.request('artist.getTopAlbums', {
-        artist: 'Roniit',
-        handlers: {
-          success: (data) => done(null, data.topalbums.album.slice(0, 3)),
-          error: (err) => done(err)
-        }
+    });
+  const artistTopAlbums = () =>
+      new Promise((resolve, reject) => {
+        lastfm.request('artist.getTopAlbums', {
+          artist: 'Roniit',
+          handlers: {
+            success: (data) => {
+              resolve(data.topalbums.album.slice(0, 3));
+            },
+            error: reject
+          }
+        });
       });
-    }
-  },
-  (err, results) => {
-    if (err) { return next(err); }
+  Promise.all([
+    artistInfo(),
+    artistTopTracks(),
+    artistTopAlbums()
+  ])
+  .then(([artistInfo, artistTopAlbums, artistTopTracks]) => {
     const artist = {
-      name: results.artistInfo.artist.name,
-      image: results.artistInfo.artist.image.slice(-1)[0]['#text'],
-      tags: results.artistInfo.artist.tags.tag,
-      bio: results.artistInfo.artist.bio.summary,
-      stats: results.artistInfo.artist.stats,
-      similar: results.artistInfo.artist.similar.artist,
-      topAlbums: results.artistTopAlbums,
-      topTracks: results.artistTopTracks
+      name: artistInfo.artist.name,
+      image: artistInfo.artist.image.slice(-1)[0]['#text'],
+      tags: artistInfo.artist.tags.tag,
+      bio: artistInfo.artist.bio.summary,
+      stats: artistInfo.artist.stats,
+      similar: artistInfo.artist.similar.artist,
+      topAlbums: artistTopAlbums,
+      topTracks: artistTopTracks
     };
     res.render('api/lastfm', {
       title: 'Last.fm API',
       artist
     });
-  });
+  })
+  .catch(next);
 };
 
 /**
  * GET /api/twitter
- * Twiter API example.
+ * Twitter API example.
  */
 exports.getTwitter = (req, res, next) => {
   const token = req.user.tokens.find(token => token.kind === 'twitter');
@@ -286,7 +269,7 @@ exports.postTwitter = (req, res, next) => {
     access_token: token.accessToken,
     access_token_secret: token.tokenSecret
   });
-  T.post('statuses/update', { status: req.body.tweet }, (err, data, response) => {
+  T.post('statuses/update', { status: req.body.tweet }, (err) => {
     if (err) { return next(err); }
     req.flash('success', { msg: 'Your tweet has been posted.' });
     res.redirect('/api/twitter');
@@ -300,45 +283,51 @@ exports.postTwitter = (req, res, next) => {
 exports.getSteam = (req, res, next) => {
   const steamId = '76561197982488301';
   const params = { l: 'english', steamid: steamId, key: process.env.STEAM_KEY };
-  async.parallel({
-    playerAchievements: (done) => {
-      params.appid = '49520';
-      request.get({ url: 'http://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/', qs: params, json: true }, (err, request, body) => {
+  const playerAchievements = () => {
+    params.appid = '49520';
+    return request.getAsync({ url: 'http://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/', qs: params, json: true })
+      .then(([request, body]) => {
         if (request.statusCode === 401) {
-          return done(new Error('Invalid Steam API Key'));
+          throw new Error('Invalid Steam API Key');
         }
-        done(err, body);
+        return body;
       });
-    },
-    playerSummaries: (done) => {
-      params.steamids = steamId;
-      request.get({ url: 'http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/', qs: params, json: true }, (err, request, body) => {
+  };
+  const playerSummaries = () => {
+    params.steamids = steamId;
+    return request.getAsync({ url: 'http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/', qs: params, json: true })
+      .then(([request, body]) => {
         if (request.statusCode === 401) {
-          return done(new Error('Missing or Invalid Steam API Key'));
+          throw Error('Missing or Invalid Steam API Key');
         }
-        done(err, body);
+        return body;
       });
-    },
-    ownedGames: (done) => {
-      params.include_appinfo = 1;
-      params.include_played_free_games = 1;
-      request.get({ url: 'http://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/', qs: params, json: true }, (err, request, body) => {
+  };
+  const ownedGames = () => {
+    params.include_appinfo = 1;
+    params.include_played_free_games = 1;
+    return request.getAsync({ url: 'http://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/', qs: params, json: true })
+      .then(([request, body]) => {
         if (request.statusCode === 401) {
-          return done(new Error('Missing or Invalid Steam API Key'));
+          throw new Error('Missing or Invalid Steam API Key');
         }
-        done(err, body);
+        return body;
       });
-    }
-  },
-  (err, results) => {
-    if (err) { return next(err); }
+  };
+  Promise.all([
+    playerAchievements(),
+    playerSummaries(),
+    ownedGames()
+  ])
+  .then(([playerAchievements, playerSummaries, ownedGames]) => {
     res.render('api/steam', {
       title: 'Steam Web API',
-      ownedGames: results.ownedGames.response.games,
-      playerAchievemments: results.playerAchievements.playerstats,
-      playerSummary: results.playerSummaries.response.players[0]
+      ownedGames: ownedGames.response.games,
+      playerAchievemments: playerAchievements.playerstats,
+      playerSummary: playerSummaries.response.players[0]
     });
-  });
+  })
+  .catch(next);
 };
 
 /**
@@ -439,77 +428,6 @@ exports.postClockwork = (req, res, next) => {
 };
 
 /**
- * GET /api/venmo
- * Venmo API example.
- */
-exports.getVenmo = (req, res, next) => {
-  const token = req.user.tokens.find(token => token.kind === 'venmo');
-  const query = { access_token: token.accessToken };
-  async.parallel({
-    getProfile: (done) => {
-      request.get({ url: 'https://api.venmo.com/v1/me', qs: query, json: true }, (err, request, body) => {
-        done(err, body);
-      });
-    },
-    getRecentPayments: (done) => {
-      request.get({ url: 'https://api.venmo.com/v1/payments', qs: query, json: true }, (err, request, body) => {
-        done(err, body);
-      });
-    }
-  },
-  (err, results) => {
-    if (err) { return next(err); }
-    res.render('api/venmo', {
-      title: 'Venmo API',
-      profile: results.getProfile.data,
-      recentPayments: results.getRecentPayments.data
-    });
-  });
-};
-
-/**
- * POST /api/venmo
- * Send money.
- */
-exports.postVenmo = (req, res, next) => {
-  req.assert('user', 'Phone, Email or Venmo User ID cannot be blank').notEmpty();
-  req.assert('note', 'Please enter a message to accompany the payment').notEmpty();
-  req.assert('amount', 'The amount you want to pay cannot be blank').notEmpty();
-
-  const errors = req.validationErrors();
-
-  if (errors) {
-    req.flash('errors', errors);
-    return res.redirect('/api/venmo');
-  }
-
-  const token = req.user.tokens.find(token => token.kind === 'venmo');
-  const formData = {
-    access_token: token.accessToken,
-    note: req.body.note,
-    amount: req.body.amount
-  };
-
-  if (validator.isEmail(req.body.user)) {
-    formData.email = req.body.user;
-  } else if (validator.isNumeric(req.body.user) && validator.isLength(req.body.user, 10, 11)) {
-    formData.phone = req.body.user;
-  } else {
-    formData.user_id = req.body.user;
-  }
-
-  request.post('https://api.venmo.com/v1/payments', { form: formData }, (err, request, body) => {
-    if (err) { return next(err); }
-    if (request.statusCode !== 200) {
-      req.flash('errors', { msg: JSON.parse(body).error.message });
-      return res.redirect('/api/venmo');
-    }
-    req.flash('success', { msg: 'Venmo money transfer complete' });
-    res.redirect('/api/venmo');
-  });
-};
-
-/**
  * GET /api/linkedin
  * LinkedIn API example.
  */
@@ -533,65 +451,22 @@ exports.getInstagram = (req, res, next) => {
   const token = req.user.tokens.find(token => token.kind === 'instagram');
   ig.use({ client_id: process.env.INSTAGRAM_ID, client_secret: process.env.INSTAGRAM_SECRET });
   ig.use({ access_token: token.accessToken });
-  async.parallel({
-    searchByUsername: (done) => {
-      ig.user_search('richellemead', (err, users) => {
-        done(err, users);
-      });
-    },
-    searchByUserId: (done) => {
-      ig.user('175948269', (err, user) => {
-        done(err, user);
-      });
-    },
-    popularImages: (done) => {
-      ig.media_popular((err, medias) => {
-        done(err, medias);
-      });
-    },
-    myRecentMedia: (done) => {
-      ig.user_self_media_recent((err, medias) => {
-        done(err, medias);
-      });
-    }
-  }, (err, results) => {
-    if (err) { return next(err); }
+  Promise.all([
+    ig.user_searchAsync('richellemead'),
+    ig.userAsync('175948269'),
+    ig.media_popularAsync(),
+    ig.user_self_media_recentAsync()
+  ])
+  .then(([searchByUsername, searchByUserId, popularImages, myRecentMedia]) => {
     res.render('api/instagram', {
       title: 'Instagram API',
-      usernames: results.searchByUsername,
-      userById: results.searchByUserId,
-      popularImages: results.popularImages,
-      myRecentMedia: results.myRecentMedia
+      usernames: searchByUsername,
+      userById: searchByUserId,
+      popularImages,
+      myRecentMedia
     });
-  });
-};
-
-/**
- * GET /api/yahoo
- * Yahoo API example.
- */
-exports.getYahoo = (req, res) => {
-  async.parallel([
-    function getFinanceStocks(done) {
-      Y.YQL('SELECT * FROM yahoo.finance.quote WHERE symbol in ("YHOO", "TSLA", "GOOG", "MSFT")', (response) => {
-        const quotes = response.query.results.quote;
-        done(null, quotes);
-      });
-    },
-    function getWeatherReport(done) {
-      Y.YQL('SELECT * FROM weather.forecast WHERE woeid in (SELECT woeid FROM geo.places(1) WHERE text="nome, ak")', (response) => {
-        const location = response.query.results.channel.location;
-        const condition = response.query.results.channel.item.condition;
-        done(null, { location, condition });
-      });
-    }
-  ], (err, results) => {
-    res.render('api/yahoo', {
-      title: 'Yahoo API',
-      quotes: results[0],
-      weather: results[1]
-    });
-  });
+  })
+  .catch(next);
 };
 
 /**
@@ -679,76 +554,17 @@ exports.getLob = (req, res, next) => {
 };
 
 /**
- * GET /api/bitgo
- * BitGo wallet example
+ * GET /api/upload
+ * File Upload API example.
  */
-exports.getBitGo = (req, res, next) => {
-  const bitgo = new BitGo.BitGo({ env: 'test', accessToken: process.env.BITGO_ACCESS_TOKEN });
-  const walletId = req.session.walletId;
-  const renderWalletInfo = (walletId) => {
-    bitgo.wallets().get({ id: walletId }, (err, walletResponse) => {
-      walletResponse.createAddress({}, (err, addressResponse) => {
-        walletResponse.transactions({}, (err, transactionsResponse) => {
-          res.render('api/bitgo', {
-            title: 'BitGo API',
-            wallet: walletResponse.wallet,
-            address: addressResponse.address,
-            transactions: transactionsResponse.transactions
-          });
-        });
-      });
-    });
-  };
 
-  if (walletId) {
-    renderWalletInfo(walletId);
-  } else {
-    bitgo.wallets().createWalletWithKeychains({
-      passphrase: req.sessionID, // change this!
-      label: `wallet for session ${req.sessionID}`,
-      backupXpub: 'xpub6AHA9hZDN11k2ijHMeS5QqHx2KP9aMBRhTDqANMnwVtdyw2TDYRmF8PjpvwUFcL1Et8Hj59S3gTSMcUQ5gAqTz3Wd8EsMTmF3DChhqPQBnU'
-    }, (err, res) => {
-      req.session.walletId = res.wallet.wallet.id;
-      renderWalletInfo(req.session.walletId);
-    });
-  }
-};
-
-/**
- * POST /api/bitgo
- * BitGo send coins example
- */
-exports.postBitGo = (req, res) => {
-  const bitgo = new BitGo.BitGo({ env: 'test', accessToken: process.env.BITGO_ACCESS_TOKEN });
-  const walletId = req.session.walletId;
-  try {
-    bitgo.wallets().get({ id: walletId }, (err, wallet) => {
-      wallet.sendCoins({
-        address: req.body.address,
-        amount: parseInt(req.body.amount, 10),
-        walletPassphrase: req.sessionID
-      }, (err, result) => {
-        if (err) {
-          req.flash('errors', { msg: err.message });
-          return res.redirect('/api/bitgo');
-        }
-        req.flash('info', { msg: `txid: ${result.hash}, hex: ${result.tx}` });
-        return res.redirect('/api/bitgo');
-      });
-    });
-  } catch (err) {
-    req.flash('errors', { msg: err.message });
-    return res.redirect('/api/bitgo');
-  }
-};
-
-exports.getFileUpload = (req, res, next) => {
+exports.getFileUpload = (req, res) => {
   res.render('api/upload', {
     title: 'File Upload'
   });
 };
 
-exports.postFileUpload = (req, res, next) => {
+exports.postFileUpload = (req, res) => {
   req.flash('success', { msg: 'File was uploaded successfully.' });
   res.redirect('/api/upload');
 };
@@ -800,5 +616,11 @@ exports.postPinterest = (req, res, next) => {
     }
     req.flash('success', { msg: 'Pin created' });
     res.redirect('/api/pinterest');
+  });
+};
+
+exports.getGoogleMaps = (req, res) => {
+  res.render('api/google-maps', {
+    title: 'Google Maps API'
   });
 };
